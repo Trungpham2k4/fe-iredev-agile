@@ -2,14 +2,14 @@
 # =============================================================================
 # Flask application entry point.
 #
-# Serves two things on the same port:
-#   1. REST API  — http://localhost:8000/api/...
-#   2. WebSocket — ws://localhost:8000/ws?token=<jwt>
-#
-# Run:
-#   python app.py
+# FIXES:
+#   1. Added logging configuration so auth rejections print to console.
+#   2. Explicit threaded=True for Flask dev server — required for WebSocket
+#      + REST to work simultaneously without blocking.
+#   3. use_reloader=False prevents the reloader from killing WS connections.
 # =============================================================================
 
+import logging
 from flask      import Flask, jsonify
 from flask_cors import CORS
 from flask_sock import Sock
@@ -20,28 +20,33 @@ from routes.chat_routes import chat_bp
 from ws_handler         import handle_connection
 
 
-# ── App + WebSocket setup ─────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Print DEBUG-level logs from auth_utils and ws_handler so 401 rejections
+# show the exact reason in the server console.
+logging.basicConfig(
+    level    = logging.DEBUG,
+    format   = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt  = "%H:%M:%S",
+)
+# Reduce noise from werkzeug HTTP logs (keep them at WARNING)
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
 
 app  = Flask(__name__)
-sock = Sock(app)   # attaches the WebSocket layer to Flask
+sock = Sock(app)
 
-# Allow the React dev server (localhost:5173) to call this API with auth headers
 CORS(app, origins=CORS_ORIGINS, supports_credentials=True)
-
-
-# ── REST blueprints ───────────────────────────────────────────────────────────
 
 app.register_blueprint(auth_bp, url_prefix="/api/auth")
 app.register_blueprint(chat_bp, url_prefix="/api/chats")
 
 
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
-# The frontend connects once at startup:  ws://localhost:8000/ws?token=<jwt>
-# All AI streaming happens over this persistent connection.
 
 @sock.route("/ws")
 def websocket(ws):
-    """WebSocket entry point — delegates to ws_handler.handle_connection()."""
     handle_connection(ws)
 
 
@@ -49,10 +54,10 @@ def websocket(ws):
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "message": "Server is running."}), 200
+    return jsonify({"status": "ok"}), 200
 
 
-# ── Global error handlers ─────────────────────────────────────────────────────
+# ── Error handlers ────────────────────────────────────────────────────────────
 
 @app.errorhandler(404)
 def not_found(e):
@@ -87,15 +92,16 @@ if __name__ == "__main__":
 ║    POST   /api/chats/<id>/messages                       ║
 ╠══════════════════════════════════════════════════════════╣
 ║  WebSocket  ws://localhost:{PORT}/ws?token=<jwt>           ║
-║    send  {{ "type": "chat_message", chatId, messageId,  ║
-║             content }}  → streams tokens back            ║
-║    send  {{ "type": "stop_stream",  chatId }}            ║
-║    send  {{ "type": "ping" }}       → pong               ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Demo accounts                                           ║
 ║    demo@example.com   /  password123                     ║
 ║    admin@example.com  /  admin123                        ║
 ╚══════════════════════════════════════════════════════════╝
 """)
-    # use_reloader=False prevents background streaming threads from being killed
-    app.run(host="0.0.0.0", port=PORT, debug=True, use_reloader=False)
+    app.run(
+        host        = "0.0.0.0",
+        port        = PORT,
+        debug       = True,
+        use_reloader= False,   # MUST be False — reloader kills WS connections
+        threaded    = True,    # MUST be True  — WS + REST need concurrent threads
+    )

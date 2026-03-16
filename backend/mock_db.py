@@ -159,3 +159,19 @@ def add_message(chat_id: str, role: str, content: str) -> dict:
     if chat_id in CHATS:
         CHATS[chat_id]["date"] = "Today"
     return msg
+
+
+# =============================================================================
+# Artifacts  (saved after accept)
+# =============================================================================
+
+ARTIFACTS: dict = {}  # { artifact_id: artifact_dict }
+
+def save_artifact(chat_id: str, message_id: str, artifact: dict) -> dict:
+    """Persist an accepted artifact so it can be retrieved later."""
+    entry = {**artifact, 'chatId': chat_id, 'messageId': message_id}
+    ARTIFACTS[artifact['id']] = entry
+    return entry
+
+def get_artifact(artifact_id: str) -> dict | None:
+    return ARTIFACTS.get(artifact_id)

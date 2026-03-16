@@ -1,20 +1,16 @@
 // src/hooks/useChat.js
 // =============================================================================
-// Central chat state hook.
+// Central chat state hook — handles streaming, artifacts, and feedback loop.
 //
-// Data flow:
-//   Mount             → GET /api/chats               load sidebar
-//   selectChat(id)    → GET /api/chats/:id/messages   load history
-//   sendMessage(text) →
-//     1. POST /api/chats          (if no active chat — creates one)
-//     2. Show user bubble + assistant placeholder immediately (optimistic)
-//     3. POST /api/chats/:id/messages   (saves user message → returns saved msg)
-//     4. wsService.sendChatMessage()    (server streams tokens via WebSocket)
-//     WS "token"    → append to assistant bubble
-//     WS "done"     → remove streaming cursor
-//     WS "artifact" → attach artifact card
-//     WS "error"    → show error text
-//   cancelStream()  → wsService.stopStream()
+// WebSocket events handled:
+//   token            → append to assistant bubble
+//   done             → mark message finished
+//   artifact         → attach artifact (awaitingFeedback=true → show feedback bar)
+//   artifact_revised → update artifact with new version, still awaiting feedback
+//   artifact_accepted→ mark artifact as accepted, hide feedback bar
+//   artifact_timeout → auto-accepted after timeout
+//   revision_start   → add new "Revising..." assistant message
+//   error            → show error in bubble
 // =============================================================================
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { useWebSocket }  from './useWebSocket'
@@ -28,6 +24,7 @@ import {
 } from '../services/chatService'
 import { SAMPLE_CHATS } from '../data/sampleData'
 import { uid }          from '../utils/helpers'
+import { useAuth }      from '../context/AuthContext'
 
 export function useChat() {
   const [chats,           setChats]           = useState([])
@@ -40,89 +37,177 @@ export function useChat() {
   const [error,           setError]           = useState(null)
   const [wsConnected,     setWsConnected]     = useState(false)
 
-  // Stable ref so WS callbacks always see the latest chatId
-  const activeChatIdRef = useRef(activeChatId)
+  // authVersion from AuthContext — increments on every login.
+  // We use it as a dependency so loadChats re-runs after logout→login.
+  const { authVersion } = useAuth()
+
+  const activeChatIdRef   = useRef(activeChatId)
+  const placeholderIdRef  = useRef(null)   // current assistant placeholder id
+
   useEffect(() => { activeChatIdRef.current = activeChatId }, [activeChatId])
 
-  // Ref to the current placeholder ID so WS callbacks can find the right bubble
-  const placeholderIdRef = useRef(null)
+  // ── Helper: update a message by its id ────────────────────────────────────
+  const updateMessage = useCallback((id, updater) => {
+    setMessages(prev => prev.map(m => m.id === id ? { ...m, ...updater(m) } : m))
+  }, [])
+
+  // ── Helper: find message by id or placeholder ──────────────────────────────
+  const findMessageId = useCallback((messageId) => {
+    // Returns the id we should use to look up the message in state
+    // (could be the server id or the placeholder id on first token)
+    return messageId
+  }, [])
 
   // ── WebSocket event handlers ───────────────────────────────────────────────
 
+  // Each streamed word — append to the right bubble
   const handleToken = useCallback(({ chatId, messageId, token }) => {
-    // Ignore tokens for a different chat (user may have switched chats)
     if (chatId !== activeChatIdRef.current) return
-
-    setMessages((prev) =>
-      prev.map((m) => {
-        // Match by explicit messageId OR by our placeholder ID on first token
-        if (m.id === messageId || m.id === placeholderIdRef.current) {
-          // On first token, adopt the server's messageId as the real ID
-          return { ...m, id: messageId, content: m.content + token }
-        }
-        return m
-      })
-    )
+    setMessages(prev => prev.map(m => {
+      if (m.id === messageId || m.id === placeholderIdRef.current) {
+        return { ...m, id: messageId, content: m.content + token }
+      }
+      return m
+    }))
   }, [])
 
+  // Stream finished — remove cursor
   const handleDone = useCallback(({ chatId, messageId }) => {
     if (chatId !== activeChatIdRef.current) return
-
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === messageId || m.id === placeholderIdRef.current
-          ? { ...m, id: messageId, streaming: false }
-          : m
-      )
-    )
+    setMessages(prev => prev.map(m =>
+      m.id === messageId || m.id === placeholderIdRef.current
+        ? { ...m, id: messageId, streaming: false }
+        : m
+    ))
     placeholderIdRef.current = null
     setStreaming(false)
   }, [])
 
-  const handleError = useCallback(({ chatId, messageId, error: serverError }) => {
+  // New artifact arrived — attach to message, mark awaitingFeedback
+  const handleArtifact = useCallback(({ chatId, messageId, artifact,
+                                         awaitingFeedback, iteration, maxIterations }) => {
     if (chatId !== activeChatIdRef.current) return
 
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === messageId || m.id === placeholderIdRef.current
-          ? {
-              ...m,
-              content:   `⚠️ ${serverError || 'Something went wrong.'}`,
-              streaming: false,
-              isError:   true,
-            }
-          : m
-      )
-    )
+    // Attach messageId to the artifact so sendArtifactFeedback can include it
+    // in the artifact_feedback WS frame (backend needs it for routing).
+    const enriched = { ...artifact, awaitingFeedback, iteration, maxIterations,
+                        messageId, chatId }
+
+    setMessages(prev => prev.map(m =>
+      m.id === messageId || m.id === placeholderIdRef.current
+        ? { ...m, artifact: enriched }
+        : m
+    ))
+
+    // Auto-open the artifact panel so the user sees the feedback bar
+    setOpenArtifact(enriched)
+  }, [])
+
+  // Revised artifact — update artifact on the same message bubble
+  const handleArtifactRevised = useCallback(({ chatId, messageId, artifact,
+                                                awaitingFeedback, iteration, maxIterations }) => {
+    if (chatId !== activeChatIdRef.current) return
+
+    const enriched = { ...artifact, awaitingFeedback, iteration, maxIterations,
+                        messageId, chatId }
+
+    setMessages(prev => prev.map(m =>
+      m.id === messageId
+        ? { ...m, artifact: enriched }
+        : m
+    ))
+    setOpenArtifact(enriched)
+  }, [])
+
+  // Artifact accepted (by user or by auto-accept on timeout/max revisions)
+  const handleArtifactAccepted = useCallback(({ chatId, messageId, artifactId, autoAccepted }) => {
+    if (chatId !== activeChatIdRef.current) return
+
+    // Mark the artifact on the message as accepted (removes feedback bar)
+    setMessages(prev => prev.map(m => {
+      if (m.id !== messageId) return m
+      if (!m.artifact)        return m
+      return {
+        ...m,
+        artifact: {
+          ...m.artifact,
+          accepted:         true,
+          awaitingFeedback: false,
+        }
+      }
+    }))
+
+    // Update the open panel too
+    setOpenArtifact(prev => {
+      if (!prev) return null
+      return { ...prev, accepted: true, awaitingFeedback: false }
+    })
+  }, [])
+
+  // Feedback timed out — same treatment as accepted (backend auto-accepted)
+  const handleArtifactTimeout = useCallback(({ chatId, messageId, artifactId }) => {
+    if (chatId !== activeChatIdRef.current) return
+    handleArtifactAccepted({ chatId, messageId, artifactId, autoAccepted: true })
+  }, [handleArtifactAccepted])
+
+  // Backend is about to stream revision tokens — add a new assistant bubble
+  const handleRevisionStart = useCallback(({ chatId, messageId, comment, iteration }) => {
+    if (chatId !== activeChatIdRef.current) return
+
+    setMessages(prev => [...prev, {
+      id:        messageId,
+      role:      'assistant',
+      content:   '',
+      streaming: true,
+      isRevision: true,
+      revisionComment: comment,
+      iteration,
+    }])
+    // Track this as the current placeholder so token handler can find it
+    placeholderIdRef.current = messageId
+    setStreaming(true)
+  }, [])
+
+  const handleWsError = useCallback(({ chatId, messageId, error: serverError }) => {
+    if (chatId !== activeChatIdRef.current) return
+    setMessages(prev => prev.map(m =>
+      m.id === messageId || m.id === placeholderIdRef.current
+        ? { ...m, content: `⚠️ ${serverError || 'Something went wrong.'}`,
+            streaming: false, isError: true }
+        : m
+    ))
     placeholderIdRef.current = null
     setStreaming(false)
     setError(serverError || 'Failed to get a response.')
   }, [])
 
-  const handleArtifact = useCallback(({ chatId, messageId, artifact }) => {
-    if (chatId !== activeChatIdRef.current) return
-
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === messageId || m.id === placeholderIdRef.current
-          ? { ...m, artifact }
-          : m
-      )
-    )
-  }, [])
-
-  // Register WS handlers (does NOT open the connection — AuthContext does that)
+  // Wire up all WS handlers
   useWebSocket({
-    onToken:       handleToken,
-    onDone:        handleDone,
-    onError:       handleError,
-    onArtifact:    handleArtifact,
-    onConnected:   () => setWsConnected(true),
-    onDisconnected:() => setWsConnected(false),
+    onToken:           handleToken,
+    onDone:            handleDone,
+    onError:           handleWsError,
+    onArtifact:        handleArtifact,
+    onArtifactRevised: handleArtifactRevised,
+    onArtifactAccepted:handleArtifactAccepted,
+    onArtifactTimeout: handleArtifactTimeout,
+    onRevisionStart:   handleRevisionStart,
+    onConnected:       () => setWsConnected(true),
+    onDisconnected:    () => setWsConnected(false),
   })
 
   // ── Load sidebar on mount ──────────────────────────────────────────────────
   useEffect(() => {
+    // Skip the initial run when authVersion is 0 (not yet authenticated)
+    if (authVersion === 0) return
+
+    // Reset state so the sidebar shows the loading skeleton
+    // instead of stale chats from the previous session
+    setChats([])
+    setActiveChatId(null)
+    setMessages([])
+    setOpenArtifact(null)
+    setLoadingChats(true)
+
     async function load() {
       try {
         const data = await apiFetchChats()
@@ -135,7 +220,7 @@ export function useChat() {
       }
     }
     load()
-  }, [])
+  }, [authVersion])  // re-runs every time the user logs in
 
   // ── Actions ────────────────────────────────────────────────────────────────
 
@@ -153,18 +238,16 @@ export function useChat() {
     if (id === activeChatId) return
     if (activeChatId) wsService.stopStream(activeChatId)
     placeholderIdRef.current = null
-
     setActiveChatId(id)
     setMessages([])
     setOpenArtifact(null)
     setError(null)
     setStreaming(false)
     setLoadingMessages(true)
-
     try {
       const data = await apiFetchMessages(id)
       setMessages(data)
-    } catch (err) {
+    } catch {
       setError('Could not load messages. Please try again.')
     } finally {
       setLoadingMessages(false)
@@ -180,10 +263,8 @@ export function useChat() {
       setOpenArtifact(null)
       setStreaming(false)
     }
-    setChats((prev) => prev.filter((c) => c.id !== id))
-    try {
-      await apiDeleteChat(id)
-    } catch {
+    setChats(prev => prev.filter(c => c.id !== id))
+    try { await apiDeleteChat(id) } catch {
       try { setChats(await apiFetchChats()) } catch {}
     }
   }, [activeChatId])
@@ -191,12 +272,13 @@ export function useChat() {
   const cancelStream = useCallback(() => {
     if (activeChatId) wsService.stopStream(activeChatId)
     setStreaming(false)
-    setMessages((prev) =>
-      prev.map((m) => m.streaming ? { ...m, streaming: false } : m)
-    )
+    setMessages(prev => prev.map(m => m.streaming ? { ...m, streaming: false } : m))
     placeholderIdRef.current = null
   }, [activeChatId])
 
+  /**
+   * Send a user message → saves via REST → triggers WS streaming.
+   */
   const sendMessage = useCallback(async (text) => {
     if (!text.trim() || streaming) return
     setError(null)
@@ -204,69 +286,90 @@ export function useChat() {
     const trimmed = text.trim()
     let chatId    = activeChatId
 
-    // ── Create new chat if on home screen ─────────────────────────────────────
+    // Create new chat if needed
     if (!chatId) {
       const title  = trimmed.slice(0, 50) + (trimmed.length > 50 ? '…' : '')
       const tempId = `temp_${uid()}`
-
-      setChats((prev) => [{ id: tempId, title, date: 'Today' }, ...prev])
+      setChats(prev => [{ id: tempId, title, date: 'Today' }, ...prev])
       setActiveChatId(tempId)
       chatId = tempId
-
       try {
         const serverChat = await apiCreateChat(title)
-        setChats((prev) => prev.map((c) => c.id === tempId ? serverChat : c))
+        setChats(prev => prev.map(c => c.id === tempId ? serverChat : c))
         setActiveChatId(serverChat.id)
         chatId = serverChat.id
-      } catch (err) {
-        setChats((prev) => prev.filter((c) => c.id !== tempId))
+      } catch {
+        setChats(prev => prev.filter(c => c.id !== tempId))
         setActiveChatId(null)
         setError('Could not create conversation. Please try again.')
         return
       }
     }
 
-    // ── Show user bubble immediately ───────────────────────────────────────────
+    // Optimistic user bubble
     const localUserMsgId = `local_${uid()}`
-    setMessages((prev) => [...prev, {
-      id:      localUserMsgId,
-      role:    'user',
-      content: trimmed,
-    }])
+    setMessages(prev => [...prev, { id: localUserMsgId, role: 'user', content: trimmed }])
 
-    // ── Add empty assistant placeholder with blinking cursor ───────────────────
+    // Empty assistant placeholder with cursor
     const placeholderId = `ph_${uid()}`
-    placeholderIdRef.current = placeholderId   // tracked in ref for WS callbacks
-
-    setMessages((prev) => [...prev, {
-      id:        placeholderId,
-      role:      'assistant',
-      content:   '',
-      streaming: true,
-    }])
+    placeholderIdRef.current = placeholderId
+    setMessages(prev => [...prev, { id: placeholderId, role: 'assistant', content: '', streaming: true }])
     setStreaming(true)
 
-    // ── Save user message via REST, then trigger WS streaming ─────────────────
     try {
       const savedMsg = await apiSendMessage(chatId, trimmed)
-
-      // Replace the optimistic local message with the server-confirmed version
-      setMessages((prev) =>
-        prev.map((m) => m.id === localUserMsgId ? savedMsg : m)
-      )
-
-      // Tell the backend to start generating the AI reply.
-      // Tokens will arrive as WS "token" frames with messageId === placeholderId.
+      setMessages(prev => prev.map(m => m.id === localUserMsgId ? savedMsg : m))
       wsService.sendChatMessage(chatId, placeholderId, trimmed)
-
     } catch (err) {
-      console.error('[useChat] sendMessage REST failed:', err.message)
-      setMessages((prev) => prev.filter((m) => m.id !== placeholderId))
+      setMessages(prev => prev.filter(m => m.id !== placeholderId))
       placeholderIdRef.current = null
       setStreaming(false)
       setError('Failed to send. Please try again.')
     }
   }, [activeChatId, streaming])
+
+  /**
+   * Send artifact feedback to the backend.
+   * The backend is blocking on a threading.Event — this unblocks it.
+   *
+   * @param {'accept'|'revise'} action
+   * @param {string} comment  - The revision request (empty string for accept)
+   */
+  // Ref that always points to the current openArtifact.
+  // Using a ref here means sendArtifactFeedback never holds a stale closure
+  // (deps array [activeChatId, openArtifact] would re-create the callback on
+  //  every panel state change, but the ref always reads the latest value).
+  const openArtifactRef = useRef(null)
+  useEffect(() => { openArtifactRef.current = openArtifact }, [openArtifact])
+
+  const sendArtifactFeedback = useCallback((action, comment = '') => {
+    const art = openArtifactRef.current   // always the latest, never stale
+    if (!art) {
+      console.warn('[useChat] sendArtifactFeedback: no open artifact')
+      return
+    }
+
+    // chatId and messageId were attached to the artifact object in handleArtifact.
+    // artifactId is art.id which includes the version suffix (e.g. art_ph_abc_v1).
+    const chatId    = art.chatId    || activeChatIdRef.current
+    const messageId = art.messageId || ''
+
+    console.debug('[useChat] sendArtifactFeedback', { action, comment, artifactId: art.id, chatId, messageId })
+
+    wsService.send({
+      type:       'artifact_feedback',
+      chatId,
+      messageId,
+      artifactId: art.id,
+      action,
+      comment,
+    })
+
+    // Optimistic UI: hide the pulsing dot while waiting for backend response
+    if (action === 'accept') {
+      setOpenArtifact(prev => prev ? { ...prev, awaitingFeedback: false } : null)
+    }
+  }, [])   // stable — reads current values via refs
 
   return {
     chats, messages, activeChatId,
@@ -276,5 +379,6 @@ export function useChat() {
     setOpenArtifact, setError,
     newChat, selectChat, deleteChat,
     sendMessage, cancelStream,
+    sendArtifactFeedback,
   }
 }

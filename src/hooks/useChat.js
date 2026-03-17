@@ -83,50 +83,66 @@ export function useChat() {
     setStreaming(false)
   }, [])
 
-  // New artifact arrived — attach to message, mark awaitingFeedback
+  // New artifact arrived — attach to message, mark awaitingFeedback.
+  // NOTE: We do NOT guard on activeChatId here. The backend sends artifact
+  // frames for the chat that generated them, which may differ from the
+  // chat the user is currently viewing. We always update the message state
+  // so switching back shows the card. We only open the panel if active.
   const handleArtifact = useCallback(({ chatId, messageId, artifact,
-                                         awaitingFeedback, iteration, maxIterations }) => {
-    if (chatId !== activeChatIdRef.current) return
-
-    // Attach messageId to the artifact so sendArtifactFeedback can include it
-    // in the artifact_feedback WS frame (backend needs it for routing).
+                                         awaitingFeedback, iteration, maxIterations,
+                                         replayed }) => {
     const enriched = { ...artifact, awaitingFeedback, iteration, maxIterations,
                         messageId, chatId }
 
+    // Always update the stored message — works for any chat
     setMessages(prev => prev.map(m =>
       m.id === messageId || m.id === placeholderIdRef.current
         ? { ...m, artifact: enriched }
         : m
     ))
 
-    // Auto-open the artifact panel so the user sees the feedback bar
-    setOpenArtifact(enriched)
+    // Only open the panel if the user is currently looking at this chat.
+    // On a replayed frame (reconnect) or cross-chat update, don't hijack
+    // the panel — the user will open it when they switch back.
+    if (chatId === activeChatIdRef.current && !replayed) {
+      setOpenArtifact(enriched)
+    }
   }, [])
 
-  // Revised artifact — update artifact on the same message bubble
+  // Revised artifact — backend finished the revision, new content ready.
+  // Clear the 'revising' spinner and restore awaitingFeedback so the user
+  // can review the new version and accept or request more changes.
   const handleArtifactRevised = useCallback(({ chatId, messageId, artifact,
-                                                awaitingFeedback, iteration, maxIterations }) => {
-    if (chatId !== activeChatIdRef.current) return
-
+                                                awaitingFeedback, iteration, maxIterations,
+                                                replayed }) => {
+    // revising:false — clear the spinner set by the optimistic revise update
     const enriched = { ...artifact, awaitingFeedback, iteration, maxIterations,
-                        messageId, chatId }
+                        messageId, chatId, revising: false }
 
-    setMessages(prev => prev.map(m =>
-      m.id === messageId
-        ? { ...m, artifact: enriched }
-        : m
-    ))
-    setOpenArtifact(enriched)
+    // Match by artifactId (stable across iterations) or messageId fallback
+    setMessages(prev => prev.map(m => {
+      if (!m.artifact) return m
+      const match = m.artifact.id === artifact.id || m.id === messageId
+      return match ? { ...m, artifact: enriched } : m
+    }))
+
+    if (chatId === activeChatIdRef.current && !replayed) {
+      setOpenArtifact(enriched)
+    }
   }, [])
 
-  // Artifact accepted (by user or by auto-accept on timeout/max revisions)
+  // Artifact accepted — works for any chat (accepted=true removes feedback bar
+  // from the message card regardless of which chat is currently active)
   const handleArtifactAccepted = useCallback(({ chatId, messageId, artifactId, autoAccepted }) => {
-    if (chatId !== activeChatIdRef.current) return
-
-    // Mark the artifact on the message as accepted (removes feedback bar)
+    // Match by artifactId (stable across the placeholder→server-ID rename)
+    // rather than messageId, which may be the placeholder and not match
+    // the server-assigned ID that was adopted after the first token frame.
     setMessages(prev => prev.map(m => {
-      if (m.id !== messageId) return m
-      if (!m.artifact)        return m
+      if (!m.artifact) return m
+      // Match by artifact ID or by message ID (covers both cases)
+      const artMatch = m.artifact.id === artifactId
+      const msgMatch = m.id === messageId
+      if (!artMatch && !msgMatch) return m
       return {
         ...m,
         artifact: {
@@ -140,6 +156,8 @@ export function useChat() {
     // Update the open panel too
     setOpenArtifact(prev => {
       if (!prev) return null
+      // Match by artifactId or by the panel's own messageId
+      if (prev.id !== artifactId && prev.messageId !== messageId) return prev
       return { ...prev, accepted: true, awaitingFeedback: false }
     })
   }, [])
@@ -168,8 +186,25 @@ export function useChat() {
     setStreaming(true)
   }, [])
 
-  const handleWsError = useCallback(({ chatId, messageId, error: serverError }) => {
-    if (chatId !== activeChatIdRef.current) return
+  const handleWsError = useCallback(({ chatId, messageId, artifactId, error: serverError }) => {
+    // Artifact feedback slot expired (server restart mid-review).
+    // Clear awaitingFeedback so the bar disappears gracefully.
+    if (artifactId) {
+      setMessages(prev => prev.map(m => {
+        if (!m.artifact || m.artifact.id !== artifactId) return m
+        return { ...m, artifact: { ...m.artifact, awaitingFeedback: false } }
+      }))
+      setOpenArtifact(prev =>
+        prev && prev.id === artifactId
+          ? { ...prev, awaitingFeedback: false }
+          : prev
+      )
+      setError(serverError || 'Feedback session has ended for this artifact.')
+      return
+    }
+
+    // Regular streaming error
+    if (chatId && chatId !== activeChatIdRef.current) return
     setMessages(prev => prev.map(m =>
       m.id === messageId || m.id === placeholderIdRef.current
         ? { ...m, content: `⚠️ ${serverError || 'Something went wrong.'}`,
@@ -245,8 +280,12 @@ export function useChat() {
     setStreaming(false)
     setLoadingMessages(true)
     try {
-      const data = await apiFetchMessages(id)
-      setMessages(data)
+      const messages = await apiFetchMessages(id)
+      // Keep awaitingFeedback as-is — if the backend still has a live
+      // feedback slot, the bar should show so the user can respond.
+      // If the slot is gone (server restart), the user will get an error
+      // frame when they try to submit, which is handled in handleWsError.
+      setMessages(messages)
     } catch {
       setError('Could not load messages. Please try again.')
     } finally {
@@ -365,10 +404,28 @@ export function useChat() {
       comment,
     })
 
-    // Optimistic UI: hide the pulsing dot while waiting for backend response
-    if (action === 'accept') {
-      setOpenArtifact(prev => prev ? { ...prev, awaitingFeedback: false } : null)
+    // Optimistic UI update — different per action:
+    //   accept → hide bar immediately, show accepted badge
+    //   revise → hide bar, show 'Revising…' spinner until artifact_revised arrives
+    // We never keep awaitingFeedback:true after a click — that prevents double-submit.
+    const optimisticUpdate = (prev) => {
+      if (!prev) return null
+      if (action === 'accept') {
+        return { ...prev, awaitingFeedback: false, accepted: true }
+      }
+      // revise: clear feedback bar, mark as revising so UI shows spinner
+      return { ...prev, awaitingFeedback: false, revising: true }
     }
+
+    // Update the open panel
+    setOpenArtifact(optimisticUpdate)
+
+    // Update the message in the list so switching chats and back
+    // doesn't restore the awaiting-feedback card with the old state
+    setMessages(prev => prev.map(m => {
+      if (!m.artifact || m.artifact.id !== art.id) return m
+      return { ...m, artifact: optimisticUpdate(m.artifact) }
+    }))
   }, [])   // stable — reads current values via refs
 
   return {

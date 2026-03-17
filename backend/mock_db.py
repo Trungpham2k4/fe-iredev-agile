@@ -51,6 +51,11 @@ def check_password(user, plain): return user["password"] == _hash(plain)
 def safe_user(user): return {k:v for k,v in user.items() if k != "password"}
 
 
+# NOTE: The old TOKENS dict has been removed.
+# Token revocation is now handled by token_blacklist.py which uses
+# SHA-256 hashed keys with automatic TTL cleanup.
+
+
 # =============================================================================
 # CHATS  &  MESSAGES
 # =============================================================================
@@ -78,7 +83,19 @@ def _seed():
              "    </div>\n  )\n}\n```\n\n"
              "Each **StatCard** receives a `title` and `value` prop. "
              "Want me to add charts or live data fetching?"
-         ),"createdAt":_now()},
+         ),
+         "artifact":{
+             "id":"art_m2_v1","type":"react","language":"jsx",
+             "title":"JSX snippet","iteration":1,"accepted":True,
+             "content":(
+                 "export function Dashboard() {\n"
+                 "  return (\n    <div className=\"grid grid-cols-3 gap-4 p-6\">\n"
+                 "      <StatCard title=\"Users\"   value=\"1,240\" />\n"
+                 "      <StatCard title=\"Revenue\" value=\"$8,320\" />\n"
+                 "      <StatCard title=\"Orders\"  value=\"340\" />\n"
+                 "    </div>\n  )\n}"
+             ),
+         },"createdAt":_now()},
     ]
 
     # ── Chat 2: async/await ───────────────────────────────────────────────────
@@ -96,7 +113,17 @@ def _seed():
              "  const res  = await fetch('/api/user')\n"
              "  const user = await res.json()\n  console.log(user)\n}\n```\n\n"
              "Think of `await` as: **\"wait here until done, then continue.\"**"
-         ),"createdAt":_now()},
+         ),
+         "artifact":{
+             "id":"art_m4_v1","type":"code","language":"javascript",
+             "title":"JAVASCRIPT snippet","iteration":1,"accepted":True,
+             "content":(
+                 "async function getUser() {\n"
+                 "  const res  = await fetch('/api/user')\n"
+                 "  const user = await res.json()\n"
+                 "  console.log(user)\n}"
+             ),
+         },"createdAt":_now()},
     ]
 
     # ── Stub chats (no messages yet) ──────────────────────────────────────────
@@ -140,10 +167,17 @@ def delete_chat(chat_id: str) -> bool:
 def get_messages(chat_id: str) -> list:
     return MESSAGES.get(chat_id, [])
 
-def add_message(chat_id: str, role: str, content: str) -> dict:
+def add_message(chat_id: str, role: str, content: str,
+                artifact: dict | None = None) -> dict:
+    """
+    Persist a message.  If artifact is provided it is stored on the
+    message dict so GET /messages can return it on reload.
+    """
     mid = _new_id()
     msg = {"id":mid,"chatId":chat_id,"role":role,
            "content":content,"createdAt":_now()}
+    if artifact:
+        msg["artifact"] = artifact   # persisted so reload restores the card
     MESSAGES.setdefault(chat_id, []).append(msg)
     if chat_id in CHATS:
         CHATS[chat_id]["date"] = "Today"
@@ -164,3 +198,19 @@ def save_artifact(chat_id: str, message_id: str, artifact: dict) -> dict:
 
 def get_artifact(artifact_id: str) -> dict | None:
     return ARTIFACTS.get(artifact_id)
+
+
+def update_message_artifact(message_id: str, artifact: dict) -> bool:
+    """
+    Update the artifact stored on a message in-place.
+    Called when an artifact is accepted/timed-out so the stored message
+    reflects the final accepted state — meaning GET /messages will return
+    accepted=True and awaitingFeedback=False on reload.
+    Returns True if the message was found, False otherwise.
+    """
+    for msgs in MESSAGES.values():
+        for msg in msgs:
+            if msg["id"] == message_id:
+                msg["artifact"] = artifact
+                return True
+    return False

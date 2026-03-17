@@ -28,7 +28,14 @@
 // =============================================================================
 
 import { API_BASE_URL, REQUEST_TIMEOUT_MS } from '../config/env'
-import { getAccessToken, setAccessToken, clearAccessToken } from './tokenStore'
+import { getAccessToken, setAccessToken, clearAccessToken, hasAccessToken } from './tokenStore'
+
+// HMR: decline hot swap so _silentRestorePromise and _refreshPromise
+// survive file saves (avoids spurious /refresh calls during development).
+if (import.meta.hot) {
+  import.meta.hot.decline()
+}
+
 
 // ── Custom error class ────────────────────────────────────────────────────────
 export class ApiError extends Error {
@@ -173,24 +180,71 @@ export const del  = (path, opts = {})       => request(path, { ...opts, method: 
  * This replaces the old "read token from localStorage" pattern.
  * The browser holds the refresh cookie — we just ask the server to exchange it.
  */
+// ── Silent restore ───────────────────────────────────────────────────────────
+// Called once on app startup to exchange the HttpOnly refresh cookie for an
+// access token without requiring the user to log in again.
+//
+// Guard strategy (handles React StrictMode double-invoke and remounts):
+//
+//   1. Token already in RAM → skip /refresh entirely, just fetch /me.
+//      Covers StrictMode remount after a successful first restore.
+//
+//   2. A /refresh call is already in-flight → share that promise.
+//      Covers the synchronous double-invoke during the first mount.
+//
+//   3. No token, no in-flight call → call /refresh once and cache the promise.
+//      The promise is kept until resetSilentRestore() is called (on logout).
+//
+let _silentRestorePromise = null
+
+// Call this on logout so the next page load can restore a new session.
+export function resetSilentRestore() {
+  _silentRestorePromise = null
+}
+
 export async function silentRestore() {
-  try {
-    const resp = await fetch(`${API_BASE_URL}/api/auth/refresh`, {
-      method:      'POST',
-      credentials: 'include',
-      headers:     { 'Content-Type': 'application/json' },
-    })
-
-    if (!resp.ok) return null
-
-    const body = await resp.json()
-    setAccessToken(body.access_token)
-
-    // Fetch the user profile with the new token
-    const userResp = await request('/api/auth/me')
-    return userResp.user ?? null
-
-  } catch {
-    return null
+  // Fast path: token already in RAM (StrictMode remount, duplicate call).
+  // No need to hit /refresh — just return the current user profile.
+  if (hasAccessToken()) {
+    try {
+      const userResp = await request('/api/auth/me')
+      return userResp.user ?? null
+    } catch {
+      return null
+    }
   }
+
+  // In-flight path: another call is already running — share its result.
+  if (_silentRestorePromise) return _silentRestorePromise
+
+  // Cold path: no token, no in-flight call — call /refresh now.
+  _silentRestorePromise = (async () => {
+    try {
+      const resp = await fetch(`${API_BASE_URL}/api/auth/refresh`, {
+        method:      'POST',
+        credentials: 'include',
+        headers:     { 'Content-Type': 'application/json' },
+      })
+
+      if (!resp.ok) {
+        _silentRestorePromise = null   // allow retry if cookie appears later
+        return null
+      }
+
+      const body = await resp.json()
+      setAccessToken(body.access_token)
+
+      const userResp = await request('/api/auth/me')
+      return userResp.user ?? null
+
+    } catch {
+      _silentRestorePromise = null
+      return null
+    }
+    // Note: NO finally reset here. The promise stays set permanently
+    // so that any subsequent calls (StrictMode remount, duplicate effects)
+    // hit the hasAccessToken() fast path above instead of calling /refresh.
+  })()
+
+  return _silentRestorePromise
 }

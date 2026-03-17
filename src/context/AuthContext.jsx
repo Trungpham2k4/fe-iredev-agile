@@ -28,7 +28,7 @@ import {
   logout   as apiLogout,
   register as apiRegister,
 } from '../services/chatService'
-import { silentRestore, onUnauthenticated } from '../services/apiClient'
+import { silentRestore, onUnauthenticated, resetSilentRestore } from '../services/apiClient'
 import { clearAccessToken, getAccessToken } from '../services/tokenStore'
 import { wsService }                        from '../services/websocketService'
 
@@ -57,6 +57,7 @@ export function AuthProvider({ children }) {
     console.info('[AuthContext] Session expired')
     wsService.close()
     clearAccessToken()
+    resetSilentRestore()   // allow the next login to call /refresh fresh
     localStorage.removeItem('auth_user')
     setUser(null)
     setAuthVersion(0)
@@ -140,6 +141,7 @@ export function AuthProvider({ children }) {
     } catch {
       clearAccessToken()                // ensure RAM is cleared even if server call fails
     }
+    resetSilentRestore()               // allow the next login/page-load to restore fresh
     localStorage.removeItem('auth_user')
     setUser(null)
     setAuthVersion(0)

@@ -47,6 +47,13 @@
 import { WS_BASE_URL, WS_RECONNECT_DELAY_MS } from '../config/env'
 import { getAccessToken } from './tokenStore'
 
+// HMR: decline hot swap so the wsService singleton and its open
+// connection survive file saves during development.
+if (import.meta.hot) {
+  import.meta.hot.decline()
+}
+
+
 export class WebSocketService {
   constructor() {
     this._socket          = null

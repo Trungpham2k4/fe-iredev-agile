@@ -8,67 +8,107 @@
 //
 // All other service files import from here — nowhere else calls fetch() directly.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// =============================================================================
+// HTTP client with automatic silent token refresh.
+//
+// Security model:
+//   Access token  — lives in RAM (tokenStore.js), sent as Bearer header
+//   Refresh token — HttpOnly cookie, browser sends it automatically
+//
+// On every 401 response:
+//   1. Call POST /api/auth/refresh (browser sends refresh cookie automatically)
+//   2. If successful → store new access token in RAM, retry the original request
+//   3. If refresh fails → clear access token, fire onUnauthenticated() callbacks
+//      (AuthContext listens and shows the login screen)
+//
+// Concurrent 401s:
+//   If two requests fail simultaneously, only ONE refresh call is made.
+//   The second waits for the first to complete (promise sharing).
+// =============================================================================
+
 import { API_BASE_URL, REQUEST_TIMEOUT_MS } from '../config/env'
+import { getAccessToken, setAccessToken, clearAccessToken } from './tokenStore'
 
 // ── Custom error class ────────────────────────────────────────────────────────
-// Thrown whenever the server responds with a non-2xx status.
-// Components can catch this and inspect `.status` or `.data` for details.
 export class ApiError extends Error {
-  /**
-   * @param {number} status   - HTTP status code, e.g. 404
-   * @param {string} message  - Human-readable error message
-   * @param {any}    data     - Parsed response body (if available)
-   */
   constructor(status, message, data = null) {
     super(message)
-    this.name    = 'ApiError'
-    this.status  = status
-    this.data    = data
+    this.name   = 'ApiError'
+    this.status = status
+    this.data   = data
   }
 }
 
-// ── Token helpers ─────────────────────────────────────────────────────────────
-// Token is stored in localStorage so it survives page refreshes.
-// Replace these with your own auth strategy (cookie, session, etc.) if needed.
+// ── Unauthenticated callbacks ─────────────────────────────────────────────────
+// AuthContext registers a callback here so it can clear user state when
+// a token refresh fails (session fully expired).
+const _unauthCallbacks = new Set()
 
-/** Save the bearer token after a successful login */
-export function setAuthToken(token) {
-  localStorage.setItem('auth_token', token)
+export function onUnauthenticated(fn)    { _unauthCallbacks.add(fn);    return () => _unauthCallbacks.delete(fn) }
+function _fireUnauthenticated()          { _unauthCallbacks.forEach(fn => fn()) }
+
+// ── Silent refresh state ──────────────────────────────────────────────────────
+// Only one refresh call at a time. If two 401s arrive simultaneously,
+// both wait on the same promise instead of firing two /refresh calls.
+let _refreshPromise = null
+
+async function _doRefresh() {
+  try {
+    // The browser automatically sends the HttpOnly refresh-token cookie.
+    // No Authorization header needed — we don't have a valid access token yet.
+    const resp = await fetch(`${API_BASE_URL}/api/auth/refresh`, {
+      method:      'POST',
+      credentials: 'include',   // send cookies cross-origin
+      headers:     { 'Content-Type': 'application/json' },
+    })
+
+    if (!resp.ok) {
+      // Refresh token expired or revoked — user must log in again
+      clearAccessToken()
+      _fireUnauthenticated()
+      return false
+    }
+
+    const body = await resp.json()
+    setAccessToken(body.access_token)
+    return true
+
+  } catch {
+    clearAccessToken()
+    _fireUnauthenticated()
+    return false
+  } finally {
+    _refreshPromise = null   // allow the next refresh cycle
+  }
 }
 
-/** Clear the token on logout */
-export function clearAuthToken() {
-  localStorage.removeItem('auth_token')
-}
-
-/** Read the current token (or null if not logged in) */
-export function getAuthToken() {
-  return localStorage.getItem('auth_token')
+function _refreshOnce() {
+  if (!_refreshPromise) {
+    _refreshPromise = _doRefresh()
+  }
+  return _refreshPromise
 }
 
 // ── Core request function ─────────────────────────────────────────────────────
-
 /**
  * Make an authenticated HTTP request.
+ * Automatically retries once after a silent token refresh on 401.
  *
- * @param {string} path     - Path relative to API_BASE_URL, e.g. "/api/chats"
- * @param {object} options  - Standard fetch() options (method, body, headers…)
- * @returns {Promise<any>}  - Parsed JSON response body
- * @throws {ApiError}       - On non-2xx status
- * @throws {Error}          - On network failure or timeout
+ * @param {string}  path            - Relative path, e.g. "/api/chats"
+ * @param {object}  options         - fetch() options
+ * @param {boolean} _isRetry        - Internal: true on the retry after refresh
  */
-export async function request(path, options = {}) {
-  const url   = `${API_BASE_URL}${path}`
-  const token = getAuthToken()
+export async function request(path, options = {}, _isRetry = false) {
+  const url         = `${API_BASE_URL}${path}`
+  const accessToken = getAccessToken()
 
-  // Build headers — always send JSON, attach token if we have one
   const headers = {
     'Content-Type': 'application/json',
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
     ...options.headers,
   }
 
-  // AbortController lets us cancel the request after REQUEST_TIMEOUT_MS
   const controller = new AbortController()
   const timeoutId  = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
 
@@ -77,32 +117,40 @@ export async function request(path, options = {}) {
     response = await fetch(url, {
       ...options,
       headers,
+      credentials: 'include',   // always send cookies (needed for refresh endpoint)
       signal: controller.signal,
     })
   } catch (err) {
-    // Network failure or abort (timeout)
-    if (err.name === 'AbortError') {
-      throw new Error(`Request timed out after ${REQUEST_TIMEOUT_MS}ms: ${path}`)
-    }
+    if (err.name === 'AbortError') throw new Error(`Request timed out: ${path}`)
     throw new Error(`Network error: ${err.message}`)
   } finally {
     clearTimeout(timeoutId)
   }
 
-  // Parse body — try JSON first, fall back to plain text
+  // ── Silent refresh on 401 ─────────────────────────────────────────────────
+  if (response.status === 401 && !_isRetry) {
+    const refreshed = await _refreshOnce()
+    if (refreshed) {
+      // Retry the original request with the new access token
+      return request(path, options, true)
+    }
+    // Refresh failed — throw 401 so the caller can handle it
+    throw new ApiError(401, 'Session expired. Please log in again.')
+  }
+
+  // ── Parse response body ───────────────────────────────────────────────────
   let body
-  const contentType = response.headers.get('content-type') || ''
-  if (contentType.includes('application/json')) {
+  const ct = response.headers.get('content-type') || ''
+  if (ct.includes('application/json')) {
     body = await response.json()
   } else {
     body = await response.text()
   }
 
-  // Throw on non-2xx so callers don't need to check response.ok manually
   if (!response.ok) {
     const message =
       (typeof body === 'object' && body?.message) ||
-      (typeof body === 'object' && body?.error)  ||
+      (typeof body === 'object' && body?.error)   ||
       `HTTP ${response.status}`
     throw new ApiError(response.status, message, body)
   }
@@ -110,20 +158,39 @@ export async function request(path, options = {}) {
   return body
 }
 
-// ── Convenience method shortcuts ──────────────────────────────────────────────
+// ── Convenience methods ───────────────────────────────────────────────────────
+export const get  = (path, opts = {})       => request(path, { ...opts, method: 'GET' })
+export const post = (path, data, opts = {}) => request(path, { ...opts, method: 'POST', body: JSON.stringify(data) })
+export const put  = (path, data, opts = {}) => request(path, { ...opts, method: 'PUT',  body: JSON.stringify(data) })
+export const del  = (path, opts = {})       => request(path, { ...opts, method: 'DELETE' })
 
-/** GET /path */
-export const get = (path, options = {}) =>
-  request(path, { ...options, method: 'GET' })
+// ── Silent restore on page load ───────────────────────────────────────────────
+/**
+ * Called once on app startup.
+ * Attempts to get a fresh access token using the HttpOnly refresh cookie.
+ * Returns { user } if successful, null if no valid session exists.
+ *
+ * This replaces the old "read token from localStorage" pattern.
+ * The browser holds the refresh cookie — we just ask the server to exchange it.
+ */
+export async function silentRestore() {
+  try {
+    const resp = await fetch(`${API_BASE_URL}/api/auth/refresh`, {
+      method:      'POST',
+      credentials: 'include',
+      headers:     { 'Content-Type': 'application/json' },
+    })
 
-/** POST /path with a JSON body */
-export const post = (path, data, options = {}) =>
-  request(path, { ...options, method: 'POST', body: JSON.stringify(data) })
+    if (!resp.ok) return null
 
-/** PUT /path with a JSON body */
-export const put = (path, data, options = {}) =>
-  request(path, { ...options, method: 'PUT', body: JSON.stringify(data) })
+    const body = await resp.json()
+    setAccessToken(body.access_token)
 
-/** DELETE /path */
-export const del = (path, options = {}) =>
-  request(path, { ...options, method: 'DELETE' })
+    // Fetch the user profile with the new token
+    const userResp = await request('/api/auth/me')
+    return userResp.user ?? null
+
+  } catch {
+    return null
+  }
+}

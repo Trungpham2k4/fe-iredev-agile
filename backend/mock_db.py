@@ -4,7 +4,6 @@
 #
 # Tables:
 #   USERS     { user_id  → user_dict }
-#   TOKENS    { token    → user_id }
 #   CHATS     { chat_id  → chat_dict }
 #   MESSAGES  { chat_id  → [message_dict, ...] }
 # =============================================================================
@@ -50,16 +49,6 @@ def create_user(name, email, password):
 
 def check_password(user, plain): return user["password"] == _hash(plain)
 def safe_user(user): return {k:v for k,v in user.items() if k != "password"}
-
-
-# =============================================================================
-# TOKENS
-# =============================================================================
-TOKENS: dict = {}
-
-def register_token(token, uid): TOKENS[token] = uid
-def revoke_token(token): TOKENS.pop(token, None)
-def get_user_id_for_token(token): return TOKENS.get(token)
 
 
 # =============================================================================

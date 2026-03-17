@@ -21,102 +21,59 @@
 // Chat shape:    { id, title, date, createdAt }
 // Message shape: { id, chatId, role, content, artifact?, createdAt }
 // ─────────────────────────────────────────────────────────────────────────────
-import { get, post, del, setAuthToken, clearAuthToken } from './apiClient'
 
-// ── Authentication ────────────────────────────────────────────────────────────
+
+// =============================================================================
+// REST API calls for auth, chats, and messages.
+//
+// Auth functions work with access_token (in RAM) + refresh_token (HttpOnly
+// cookie). They never read or write localStorage — that's apiClient's job.
+// =============================================================================
+import { get, post, del } from './apiClient'
+import { setAccessToken, clearAccessToken } from './tokenStore'
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
 
 /**
- * Log in with email + password.
- * Saves the returned token to localStorage via apiClient.
- *
- * @param {{ email: string, password: string }} credentials
- * @returns {Promise<{ token: string, user: object }>}
+ * POST /api/auth/login
+ * Returns { access_token, user }.
+ * The server also sets the refresh_token HttpOnly cookie in the response.
+ * We store access_token in RAM via tokenStore.
  */
 export async function login(credentials) {
   const result = await post('/api/auth/login', credentials)
-  setAuthToken(result.token)
-  return result
+  setAccessToken(result.access_token)   // RAM only — never localStorage
+  return result                         // caller gets { access_token, user }
 }
 
 /**
- * Log out — clears the local token and tells the server.
+ * POST /api/auth/logout
+ * Server blacklists both tokens and clears the cookie.
+ * We clear the RAM access token.
  */
 export async function logout() {
   try {
     await post('/api/auth/logout', {})
   } finally {
-    // Always clear the local token, even if the server call fails
-    clearAuthToken()
+    clearAccessToken()   // always clear from RAM even if server call fails
   }
 }
 
-// ── Conversations ─────────────────────────────────────────────────────────────
-
 /**
- * Fetch all conversations for the current user (used to populate the sidebar).
- *
- * @returns {Promise<Chat[]>}
- */
-export async function fetchChats() {
-  return get('/api/chats')
-}
-
-/**
- * Create a new conversation on the server.
- *
- * @param {string} title - Initial title derived from the first message
- * @returns {Promise<Chat>}
- */
-export async function createChat(title) {
-  return post('/api/chats', { title })
-}
-
-/**
- * Delete a conversation and all its messages.
- *
- * @param {string} chatId
- * @returns {Promise<{ ok: boolean }>}
- */
-export async function deleteChat(chatId) {
-  return del(`/api/chats/${chatId}`)
-}
-
-// ── Messages ──────────────────────────────────────────────────────────────────
-
-/**
- * Fetch the full message history for a conversation.
- * Called when the user clicks an existing chat in the sidebar.
- *
- * @param {string} chatId
- * @returns {Promise<Message[]>}
- */
-export async function fetchMessages(chatId) {
-  return get(`/api/chats/${chatId}/messages`)
-}
-
-/**
- * Persist a user message to the server.
- * The AI response is NOT returned here — it comes over the WebSocket.
- *
- * @param {string} chatId
- * @param {string} content - The user's message text
- * @returns {Promise<Message>} - The saved user message (with server-assigned id)
- */
-export async function sendMessage(chatId, content) {
-  return post(`/api/chats/${chatId}/messages`, { role: 'user', content })
-}
-
-// ── Registration ──────────────────────────────────────────────────────────────
-
-/**
- * Register a new user account.
- * Saves the returned token to localStorage via apiClient.
- *
- * @param {{ name: string, email: string, password: string }} data
- * @returns {Promise<{ token: string, user: object }>}
+ * POST /api/auth/register
+ * Same flow as login.
  */
 export async function register(data) {
   const result = await post('/api/auth/register', data)
-  setAuthToken(result.token)
+  setAccessToken(result.access_token)
   return result
 }
+
+// ── Chats ─────────────────────────────────────────────────────────────────────
+
+export const fetchChats   = ()            => get('/api/chats')
+export const createChat   = (title)       => post('/api/chats', { title })
+export const deleteChat   = (chatId)      => del(`/api/chats/${chatId}`)
+export const fetchMessages = (chatId)     => get(`/api/chats/${chatId}/messages`)
+export const sendMessage   = (chatId, content) =>
+  post(`/api/chats/${chatId}/messages`, { role: 'user', content })

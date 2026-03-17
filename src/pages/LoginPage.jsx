@@ -6,23 +6,22 @@
 // - Toggles between "Sign in" and "Create account" mode
 // - Calls useAuth().login() on submit
 // - Displays server-side auth errors inline
-// ─────────────────────────────────────────────────────────────────────────────
+// Uses useAuth().login() for sign-in and useAuth().register() for sign-up.
+// Token handling is fully inside AuthContext — this component never touches
+// tokens or localStorage.
+
 import { useState } from 'react'
 import { useAuth }  from '../context/AuthContext'
 import { LoadingSpinner } from '../components/ui/LoadingSpinner'
 
 export function LoginPage() {
-  // Toggle between login and register mode
-  const [mode, setMode] = useState('login') // 'login' | 'register'
-
-  // Form field values
+  const [mode,     setMode]     = useState('login')   // 'login' | 'register'
   const [email,    setEmail]    = useState('')
   const [password, setPassword] = useState('')
-  const [name,     setName]     = useState('') // register only
+  const [name,     setName]     = useState('')         // register only
 
-  const { login, authLoading, authError, clearAuthError } = useAuth()
+  const { login, register, authLoading, authError, clearAuthError } = useAuth()
 
-  // ── Submit handler ─────────────────────────────────────────────────────────
   async function handleSubmit(e) {
     e.preventDefault()
     if (authLoading) return
@@ -30,30 +29,24 @@ export function LoginPage() {
     try {
       if (mode === 'login') {
         await login({ email, password })
-        // AuthProvider sets user → App re-renders → LoginPage unmounts
       } else {
-        // For register, call a register API then auto-login
-        // (add a register() function to AuthContext + chatService if needed)
-        await login({ email, password, name, isRegister: true })
+        await register({ name, email, password })
       }
+      // On success: AuthContext sets user → ProtectedRoute shows ChatLayout
     } catch {
-      // Error is already set in AuthContext — nothing to do here
+      // authError is already set in AuthContext — displayed below
     }
   }
 
-  // Clear the error whenever the user edits a field
   function handleFieldChange(setter) {
-    return (e) => {
-      clearAuthError()
-      setter(e.target.value)
-    }
+    return (e) => { clearAuthError(); setter(e.target.value) }
   }
 
   return (
     <div className="min-h-screen bg-[#F4F0E6] flex items-center justify-center px-4">
       <div className="w-full max-w-[380px]">
 
-        {/* ── Logo + heading ─────────────────────────────────────────── */}
+        {/* Logo + heading */}
         <div className="flex flex-col items-center mb-8">
           <div className="w-11 h-11 rounded-2xl bg-[#C96A42] flex items-center
                           justify-center mb-4 shadow-sm">
@@ -69,18 +62,15 @@ export function LoginPage() {
           </p>
         </div>
 
-        {/* ── Form card ─────────────────────────────────────────────── */}
+        {/* Form card */}
         <div className="bg-white rounded-2xl border border-[#E8E3D9]
                         shadow-[0_2px_12px_rgba(0,0,0,0.06)] p-6">
-
           <form onSubmit={handleSubmit} className="space-y-4">
 
-            {/* Name field — register only */}
+            {/* Name — register only */}
             {mode === 'register' && (
               <div>
-                <label className="block text-[12px] font-medium text-[#3D3530] mb-1.5">
-                  Full name
-                </label>
+                <label className={labelClass}>Full name</label>
                 <input
                   type="text"
                   value={name}
@@ -94,9 +84,7 @@ export function LoginPage() {
 
             {/* Email */}
             <div>
-              <label className="block text-[12px] font-medium text-[#3D3530] mb-1.5">
-                Email address
-              </label>
+              <label className={labelClass}>Email address</label>
               <input
                 type="email"
                 value={email}
@@ -111,14 +99,10 @@ export function LoginPage() {
             {/* Password */}
             <div>
               <div className="flex items-center justify-between mb-1.5">
-                <label className="block text-[12px] font-medium text-[#3D3530]">
-                  Password
-                </label>
+                <label className={labelClass}>Password</label>
                 {mode === 'login' && (
-                  <button
-                    type="button"
-                    className="text-[11px] text-[#C96A42] hover:underline"
-                  >
+                  <button type="button"
+                    className="text-[11px] text-[#C96A42] hover:underline">
                     Forgot password?
                   </button>
                 )}
@@ -137,14 +121,14 @@ export function LoginPage() {
 
             {/* Auth error */}
             {authError && (
-              <div className="flex items-center gap-2 px-3 py-2.5 bg-red-50
+              <div className="flex items-start gap-2 px-3 py-2.5 bg-red-50
                               border border-red-200 rounded-lg text-[12px] text-red-600">
-                <span>⚠</span>
-                {authError}
+                <span className="mt-px">⚠</span>
+                <span>{authError}</span>
               </div>
             )}
 
-            {/* Submit button */}
+            {/* Submit */}
             <button
               type="submit"
               disabled={authLoading}
@@ -158,25 +142,20 @@ export function LoginPage() {
             </button>
           </form>
 
-          {/* ── Mode toggle ──────────────────────────────────────────── */}
-          <div className="mt-5 pt-4 border-t border-[#F0ECE6] text-center text-[12px] text-[#8A7F72]">
+          {/* Mode toggle */}
+          <div className="mt-5 pt-4 border-t border-[#F0ECE6]
+                          text-center text-[12px] text-[#8A7F72]">
             {mode === 'login' ? (
-              <>
-                Don't have an account?{' '}
-                <button
-                  onClick={() => { setMode('register'); clearAuthError() }}
-                  className="text-[#C96A42] font-medium hover:underline"
-                >
+              <>Don't have an account?{' '}
+                <button onClick={() => { setMode('register'); clearAuthError() }}
+                  className="text-[#C96A42] font-medium hover:underline">
                   Sign up
                 </button>
               </>
             ) : (
-              <>
-                Already have an account?{' '}
-                <button
-                  onClick={() => { setMode('login'); clearAuthError() }}
-                  className="text-[#C96A42] font-medium hover:underline"
-                >
+              <>Already have an account?{' '}
+                <button onClick={() => { setMode('login'); clearAuthError() }}
+                  className="text-[#C96A42] font-medium hover:underline">
                   Sign in
                 </button>
               </>
@@ -184,8 +163,14 @@ export function LoginPage() {
           </div>
         </div>
 
-        {/* Footer */}
-        <p className="text-center text-[11px] text-[#C0B8AE] mt-5">
+        {/* Demo credentials hint */}
+        <div className="mt-4 p-3 bg-white/60 rounded-xl border border-[#E8E3D9]
+                        text-[11px] text-[#8A7F72] text-center">
+          Demo: <span className="font-mono text-[#3D3530]">demo@example.com</span>{' / '}
+          <span className="font-mono text-[#3D3530]">password123</span>
+        </div>
+
+        <p className="text-center text-[11px] text-[#C0B8AE] mt-4">
           By continuing you agree to our{' '}
           <span className="underline cursor-pointer">Terms</span> and{' '}
           <span className="underline cursor-pointer">Privacy Policy</span>
@@ -195,8 +180,8 @@ export function LoginPage() {
   )
 }
 
-// Shared input class — keeps the form DRY
-const inputClass =
+const labelClass = 'block text-[12px] font-medium text-[#3D3530] mb-1.5'
+const inputClass  =
   'w-full h-9 px-3 bg-[#FAF8F5] border border-[#E8E3D9] rounded-lg ' +
   'text-[13px] text-[#1A1410] placeholder:text-[#C0B8AE] ' +
   'focus:outline-none focus:ring-2 focus:ring-[#C96A42]/20 ' +

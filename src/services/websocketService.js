@@ -36,8 +36,17 @@
 //      console.
 // =============================================================================
  
+// =============================================================================
+// WebSocket client — uses the RAM access token (from tokenStore) for auth.
+//
+// The token is passed explicitly to connect() so:
+//   - We always use the current token, not a stale captured value
+//   - After a silent refresh, the reconnect loop re-reads the latest token
+// =============================================================================
+
 import { WS_BASE_URL, WS_RECONNECT_DELAY_MS } from '../config/env'
- 
+import { getAccessToken } from './tokenStore'
+
 export class WebSocketService {
   constructor() {
     this._socket          = null
@@ -46,34 +55,33 @@ export class WebSocketService {
     this._shouldReconnect = false
     this._token           = null
   }
- 
+
   /**
    * Open the WebSocket connection.
-   * Safe to call multiple times — does nothing if already open or connecting.
+   * Safe to call multiple times — does nothing if already OPEN or CONNECTING.
    *
-   * @param {string} token  JWT — passed explicitly (not read from localStorage)
+   * @param {string} token  Access token — stored here for reconnect use.
    */
   connect(token) {
     if (!token) {
       console.warn('[WS] connect() called without token — skipping')
       return
     }
- 
-    // Guard: do nothing if already open or in the middle of connecting
+
     const state = this._socket?.readyState
     if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
       console.debug('[WS] Already connected/connecting — skipping duplicate connect()')
       return
     }
- 
+
     this._token           = token
     this._shouldReconnect = true
     this._openSocket()
   }
- 
+
   /**
-   * Close the connection intentionally (no auto-reconnect).
-   * Call on logout.
+   * Close the connection permanently (no auto-reconnect).
+   * Called on logout.
    */
   close() {
     this._shouldReconnect = false
@@ -84,20 +92,15 @@ export class WebSocketService {
       this._socket = null
     }
   }
- 
-  /**
-   * Register a handler for an event type.
-   * Returns an unsubscribe function.
-   */
+
+  /** Register a handler. Returns an unsubscribe function. */
   on(eventType, handler) {
-    if (!this._handlers[eventType]) {
-      this._handlers[eventType] = new Set()
-    }
+    if (!this._handlers[eventType]) this._handlers[eventType] = new Set()
     this._handlers[eventType].add(handler)
     return () => this._handlers[eventType]?.delete(handler)
   }
- 
-  /** Send a JSON payload. Logs a warning if the socket is not open. */
+
+  /** Send a JSON payload. Warns if the socket is not open. */
   send(payload) {
     if (this._socket?.readyState === WebSocket.OPEN) {
       this._socket.send(JSON.stringify(payload))
@@ -106,63 +109,61 @@ export class WebSocketService {
         this._socket?.readyState, 'Payload:', payload)
     }
   }
- 
+
   sendChatMessage(chatId, messageId, content) {
     this.send({ type: 'chat_message', chatId, messageId, content })
   }
- 
+
   stopStream(chatId) {
     this.send({ type: 'stop_stream', chatId })
   }
- 
-  ping() {
-    this.send({ type: 'ping' })
-  }
- 
+
+  ping() { this.send({ type: 'ping' }) }
+
   get isConnected() {
     return this._socket?.readyState === WebSocket.OPEN
   }
- 
+
   // ---------------------------------------------------------------------------
   _openSocket() {
-    const url = `${WS_BASE_URL}/ws?token=${encodeURIComponent(this._token)}`
-    console.info('[WS] Opening connection to', url)
- 
+    // Always use the latest access token from RAM for reconnects.
+    // If a silent refresh happened between disconnects, getAccessToken()
+    // returns the new one rather than the stale one stored in this._token.
+    const token = getAccessToken() || this._token
+    if (!token) {
+      console.warn('[WS] No access token available — cannot open socket')
+      return
+    }
+    this._token = token   // keep _token in sync for close() check
+
+    const url = `${WS_BASE_URL}/ws?token=${encodeURIComponent(token)}`
+    console.info('[WS] Connecting to', url.replace(/token=.+/, 'token=<redacted>'))
     this._socket = new WebSocket(url)
- 
+
     this._socket.onopen = () => {
       console.info('[WS] Connected ✓')
       this._emit('_connected', {})
     }
- 
+
     this._socket.onmessage = (event) => {
       let msg
-      try {
-        msg = JSON.parse(event.data)
-      } catch (err) {
-        console.error('[WS] Failed to parse frame:', event.data, err)
-        return
-      }
+      try { msg = JSON.parse(event.data) }
+      catch (err) { console.error('[WS] Bad frame:', event.data, err); return }
       console.debug('[WS] ←', msg.type, msg)
       this._emit(msg.type, msg)
     }
- 
+
     this._socket.onclose = (event) => {
       console.info(`[WS] Closed code=${event.code} reason="${event.reason}"`)
       this._emit('_disconnected', { code: event.code })
- 
-      // Reconnect only on unexpected drops.
-      // Code 1000 = normal close (intentional).
-      // Code 1001 = going away (page navigation).
-      // Code 1008 = policy violation (bad token) — don't reconnect with same token.
+
       const shouldReconnect = (
         this._shouldReconnect &&
-        this._token &&
-        event.code !== 1000 &&
-        event.code !== 1001 &&
-        event.code !== 1008
+        event.code !== 1000 &&   // intentional close
+        event.code !== 1001 &&   // page navigation
+        event.code !== 1008      // policy violation (bad token — don't retry same token)
       )
- 
+
       if (shouldReconnect) {
         console.info(`[WS] Reconnecting in ${WS_RECONNECT_DELAY_MS}ms…`)
         this._reconnectTimer = setTimeout(
@@ -171,23 +172,19 @@ export class WebSocketService {
         )
       }
     }
- 
-    this._socket.onerror = (err) => {
-      console.error('[WS] Socket error:', err)
+
+    this._socket.onerror = () => {
+      console.error('[WS] Socket error')
       this._emit('_error', {})
-      // onclose always fires after onerror — reconnect is handled there
     }
   }
- 
+
   _emit(eventType, payload) {
-    this._handlers[eventType]?.forEach((handler) => {
-      try {
-        handler(payload)
-      } catch (err) {
-        console.error(`[WS] Handler threw for "${eventType}":`, err)
-      }
+    this._handlers[eventType]?.forEach(handler => {
+      try { handler(payload) }
+      catch (err) { console.error(`[WS] Handler threw for "${eventType}":`, err) }
     })
   }
 }
- 
+
 export const wsService = new WebSocketService()

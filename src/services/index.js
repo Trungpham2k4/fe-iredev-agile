@@ -6,4 +6,5 @@
 //   import { wsService }               from '../services'
 export * from './chatService'
 export * from './apiClient'
+export * from './tokenStore'
 export { wsService, WebSocketService } from './websocketService'
